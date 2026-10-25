@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  e2e:
+    # Runs the dashboard against the real API (shijinb/fastapi-production-starter) and PostgreSQL.
+    runs-on: ubuntu-latest
+    needs: check
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+      JWT_SECRET: ci-only-secret-0123456789abcdefghijklmnop
+      ACCESS_TOKEN_TTL_MINUTES: "1" # short tokens, so token refresh runs during the tests
+      API_URL: http://127.0.0.1:8000
+      COOKIE_SECURE: "false"
+      E2E_BASE_URL: http://127.0.0.1:3100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with: { repository: shijinb/fastapi-production-starter, path: api }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Start API
+        working-directory: api
+        run: |
+          pip install -r requirements.txt
+          alembic upgrade head
+          python -m scripts.seed
+          nohup uvicorn app.main:app --port 8000 > api.log 2>&1 &
+          for i in $(seq 1 30); do curl -fs http://127.0.0.1:8000/ready && break; sleep 1; done
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Build and start dashboard
+        run: |
+          npm run build
+          cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/
+          PORT=3100 HOSTNAME=127.0.0.1 nohup node .next/standalone/server.js > web.log 2>&1 &
+          for i in $(seq 1 30); do curl -fs -o /dev/null http://127.0.0.1:3100/login && break; sleep 1; done
+      - run: npx playwright test
+      - name: Logs and report on failure
+        if: failure()
+        run: tail -100 api/api.log web.log
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: playwright-report, path: playwright-report }
